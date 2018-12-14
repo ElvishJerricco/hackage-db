@@ -8,7 +8,7 @@
 
 module Distribution.Hackage.DB.Unparsed
   ( HackageDB, PackageData(..), VersionData(..)
-  , readTarball, parseTarball
+  , readTarball, parseTarball, revisions
   )
   where
 
@@ -18,9 +18,10 @@ import Distribution.Hackage.DB.Utility
 import Codec.Archive.Tar as Tar
 import Codec.Archive.Tar.Entry as Tar
 import Control.Exception
-import Data.ByteString.Lazy as BS ( ByteString, empty, readFile )
+import Data.ByteString.Lazy as BS ( ByteString, empty, readFile, null )
 import Data.Map as Map
 import Data.Time.Clock
+import Data.Vector as V
 import Distribution.Package
 import Distribution.Version
 import GHC.Generics ( Generic )
@@ -33,8 +34,9 @@ data PackageData = PackageData { preferredVersions :: ByteString
                                }
   deriving (Show, Eq, Generic)
 
-data VersionData = VersionData { cabalFile :: ByteString
-                               , metaFile  :: ByteString
+data VersionData = VersionData { cabalFile         :: ByteString
+                               , metaFile          :: ByteString
+                               , previousRevisions :: Vector ByteString
                                }
   deriving (Show, Eq, Generic)
 
@@ -62,8 +64,8 @@ handleEntry db e =
     (["preferred-versions"], NormalFile buf _) -> insertWith setConstraint pn (PackageData buf Map.empty) db
 
     ([v',file], NormalFile buf _) -> let v = parseText "Version" v' in
-          if file == pn' <.> "cabal" then insertVersionData setCabalFile pn v (VersionData buf BS.empty) db else
-          if file == "package.json" then insertVersionData setMetaFile pn v (VersionData BS.empty buf) db else
+          if file == pn' <.> "cabal" then insertVersionData setCabalFile pn v (VersionData buf BS.empty V.empty) db else
+          if file == "package.json" then insertVersionData setMetaFile pn v (VersionData BS.empty buf V.empty) db else
           throw (UnsupportedTarEntry e)
 
     (_, Directory) -> db                -- some tarballs have these superfluous entries
@@ -84,7 +86,16 @@ insertVersionData setFile pn v vd = insertWith mergeVersionData pn pd
     mergeVersionData _ old = old { versions = insertWith setFile v vd (versions old) }
 
 setCabalFile :: VersionData -> VersionData -> VersionData
-setCabalFile new old = old { cabalFile = cabalFile new }
+setCabalFile new old = old { cabalFile = cabalFile new
+                           , previousRevisions = if BS.null (cabalFile old)
+                                                 then previousRevisions old
+                                                 else previousRevisions old `V.snoc` cabalFile old
+                           }
 
 setMetaFile :: VersionData -> VersionData -> VersionData
 setMetaFile new old = old { metaFile = metaFile new }
+
+-- | Convenience function for getting all revisions, including the
+-- latest, in one vector.
+revisions :: VersionData -> Vector ByteString
+revisions v = previousRevisions v `V.snoc` cabalFile v

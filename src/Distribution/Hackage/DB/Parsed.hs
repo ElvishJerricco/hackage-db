@@ -19,6 +19,7 @@ import Data.ByteString.Lazy.UTF8 as BS
 import Data.Map as Map
 import Data.Maybe
 import Data.Time.Clock
+import Data.Vector as V hiding ((++))
 import Distribution.Package
 import Distribution.PackageDescription
 import Distribution.PackageDescription.Parsec
@@ -32,6 +33,7 @@ type PackageData = Map Version VersionData
 
 data VersionData = VersionData { cabalFile :: !GenericPackageDescription
                                , tarballHashes :: !(Map String String)
+                               , previousRevisions :: Vector GenericPackageDescription
                                }
   deriving (Show, Eq, Generic)
 
@@ -54,12 +56,12 @@ parsePackageData pn (U.PackageData pv vs') =
                     | otherwise  = parseText "preferred version range" (toString pv)
 
 parseVersionData :: PackageName -> Version -> U.VersionData -> VersionData
-parseVersionData pn v (U.VersionData cf m) =
+parseVersionData pn v (U.VersionData cf m rs) =
    mapException (\e -> HackageDBPackageVersion v (e :: SomeException)) $
-     VersionData gpd (parseMetaData pn v m)
+     VersionData (gpd cf) (parseMetaData pn v m) (fmap gpd rs)
   where
-    gpd = fromMaybe (throw (InvalidCabalFile (show (pn,v)))) $
-            parseGenericPackageDescriptionMaybe (toStrict cf)
+    gpd cf' = fromMaybe (throw (InvalidCabalFile (show (pn,v)))) $
+                parseGenericPackageDescriptionMaybe (toStrict cf')
 
 parseMetaData :: PackageName -> Version -> ByteString -> Map String String
 parseMetaData pn v buf | BS.null buf = Map.empty
@@ -68,3 +70,8 @@ parseMetaData pn v buf | BS.null buf = Map.empty
     targets = U.targets (U.signed (U.parseMetaData buf))
     target  = "<repo>/package/" ++ display pn ++ "-" ++ display v ++ ".tar.gz"
     targetData = Map.lookup target targets
+
+-- | Convenience function for getting all revisions, including the
+-- latest, in one vector.
+revisions :: VersionData -> Vector GenericPackageDescription
+revisions v = previousRevisions v `V.snoc` cabalFile v

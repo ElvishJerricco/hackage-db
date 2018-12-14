@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE MultiWayIf #-}
 
 {- |
    Maintainer:  simons@cryp.to
@@ -8,7 +9,7 @@
 
 module Distribution.Hackage.DB.Unparsed
   ( HackageDB, PackageData(..), VersionData(..)
-  , readTarball, parseTarball
+  , readTarball, parseTarball, revisions
   )
   where
 
@@ -21,6 +22,7 @@ import Control.Exception
 import Data.ByteString.Lazy as BS ( ByteString, empty, readFile )
 import Data.Map as Map
 import Data.Time.Clock
+import Data.Vector as V
 import Distribution.Package
 import Distribution.Version
 import GHC.Generics ( Generic )
@@ -33,10 +35,25 @@ data PackageData = PackageData { preferredVersions :: ByteString
                                }
   deriving (Show, Eq, Generic)
 
-data VersionData = VersionData { cabalFile :: ByteString
-                               , metaFile  :: ByteString
+data VersionData = VersionData { cabalFile         :: ByteString
+                               , metaFile          :: ByteString
+                               , previousRevisions :: Vector ByteString
                                }
   deriving (Show, Eq, Generic)
+
+type HackageDBBuilder = Map PackageName PackageDataBuilder
+
+data PackageDataBuilder = PackageDataBuilder { preferredVersionsBuilder :: ByteString
+                                             , versionsBuilder          :: Map Version VersionDataBuilder
+                                             }
+
+data VersionDataBuilder = VersionDataBuilder { cabalFileBuilder         :: Maybe ByteString
+                                             , metaFileBuilder          :: Maybe ByteString
+                                             , previousRevisionsBuilder :: Vector ByteString
+                                             }
+
+vbuilder :: VersionDataBuilder
+vbuilder = VersionDataBuilder Nothing Nothing V.empty
 
 readTarball :: Maybe UTCTime -> FilePath -> IO HackageDB
 readTarball snapshot path = fmap (parseTarball snapshot path) (BS.readFile path)
@@ -46,25 +63,45 @@ parseTarball snapshot path buf =
   mapException (\e -> HackageDBTarball path (e :: SomeException)) $
     foldEntriesUntil (maybe maxBound toEpochTime snapshot) Map.empty (Tar.read buf)
 
-foldEntriesUntil :: EpochTime -> HackageDB -> Entries FormatError -> HackageDB
-foldEntriesUntil _        db  Done       = db
+foldEntriesUntil :: EpochTime -> HackageDBBuilder -> Entries FormatError -> HackageDB
+foldEntriesUntil _        db  Done       = buildHackageDB db
 foldEntriesUntil _        _  (Fail err)  = throw (IncorrectTarfile err)
 foldEntriesUntil snapshot db (Next e es) | entryTime e <= snapshot = foldEntriesUntil snapshot (handleEntry db e) es
-                                         | otherwise               = db
+                                         | otherwise               = buildHackageDB db
 
-handleEntry :: HackageDB -> Entry -> HackageDB
+buildHackageDB :: HackageDBBuilder -> HackageDB
+buildHackageDB = either throw id . Map.traverseWithKey buildPackageData
+ where
+  buildPackageData pn pdb = do
+    vs <- Map.traverseWithKey buildVersionData (versionsBuilder pdb)
+    return PackageData
+      { preferredVersions = preferredVersionsBuilder pdb
+      , versions = vs
+      }
+  buildVersionData vn vdb = do
+    cf <- tarError "VersionDataBuilder" vn $ cabalFileBuilder vdb
+    mf <- tarError "VersionDataBuilder" vn $ metaFileBuilder vdb
+    return VersionData
+      { cabalFile = cf
+      , metaFile = mf
+      , previousRevisions = previousRevisionsBuilder vdb
+      }
+  tarError msg field = maybe (Left (InvalidRepresentationOfType msg (show field))) Right
+
+handleEntry :: HackageDBBuilder -> Entry -> HackageDBBuilder
 handleEntry db e =
   let (pn':ep) = splitDirectories (entryPath e)
       pn = parseText "PackageName" pn'
   in
   case (ep, entryContent e) of
 
-    (["preferred-versions"], NormalFile buf _) -> insertWith setConstraint pn (PackageData buf Map.empty) db
+    (["preferred-versions"], NormalFile buf _) ->
+      insertWith setConstraint pn (PackageDataBuilder buf Map.empty) db
 
-    ([v',file], NormalFile buf _) -> let v = parseText "Version" v' in
-          if file == pn' <.> "cabal" then insertVersionData setCabalFile pn v (VersionData buf BS.empty) db else
-          if file == "package.json" then insertVersionData setMetaFile pn v (VersionData BS.empty buf) db else
-          throw (UnsupportedTarEntry e)
+    ([v',file], NormalFile buf _) -> let v = parseText "Version" v' in if
+          | file == pn' <.> "cabal" -> insertVersionData setCabalFile pn v (vbuilder { cabalFileBuilder = Just buf }) db
+          | file == "package.json"  -> insertVersionData setMetaFile pn v (vbuilder { metaFileBuilder = Just buf }) db
+          | otherwise               -> throw (UnsupportedTarEntry e)
 
     (_, Directory) -> db                -- some tarballs have these superfluous entries
     ([], NormalFile {}) -> db
@@ -72,19 +109,27 @@ handleEntry db e =
 
     _ -> throw (UnsupportedTarEntry e)
 
-setConstraint :: PackageData -> PackageData -> PackageData
-setConstraint new old = old { preferredVersions = preferredVersions new }
+setConstraint :: PackageDataBuilder -> PackageDataBuilder -> PackageDataBuilder
+setConstraint new old = old { preferredVersionsBuilder = preferredVersionsBuilder new }
 
-insertVersionData :: (VersionData -> VersionData -> VersionData)
-                   -> PackageName -> Version -> VersionData
-                   -> HackageDB -> HackageDB
+insertVersionData :: (VersionDataBuilder -> VersionDataBuilder -> VersionDataBuilder)
+                   -> PackageName -> Version -> VersionDataBuilder
+                   -> HackageDBBuilder -> HackageDBBuilder
 insertVersionData setFile pn v vd = insertWith mergeVersionData pn pd
   where
-    pd = PackageData BS.empty (Map.singleton v vd)
-    mergeVersionData _ old = old { versions = insertWith setFile v vd (versions old) }
+    pd = PackageDataBuilder BS.empty (Map.singleton v vd)
+    mergeVersionData _ old = old { versionsBuilder = insertWith setFile v vd (versionsBuilder old) }
 
-setCabalFile :: VersionData -> VersionData -> VersionData
-setCabalFile new old = old { cabalFile = cabalFile new }
+setCabalFile :: VersionDataBuilder -> VersionDataBuilder -> VersionDataBuilder
+setCabalFile new old = old { cabalFileBuilder = cabalFileBuilder new
+                           , previousRevisionsBuilder = let v = previousRevisionsBuilder old
+                                                        in maybe v (V.snoc v) (cabalFileBuilder old)
+                           }
 
-setMetaFile :: VersionData -> VersionData -> VersionData
-setMetaFile new old = old { metaFile = metaFile new }
+setMetaFile :: VersionDataBuilder -> VersionDataBuilder -> VersionDataBuilder
+setMetaFile new old = old { metaFileBuilder = metaFileBuilder new }
+
+-- | Convenience function for getting all revisions, including the
+-- latest, in one vector.
+revisions :: VersionData -> Vector ByteString
+revisions v = previousRevisions v `V.snoc` cabalFile v
